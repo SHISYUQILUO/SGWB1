@@ -35,10 +35,17 @@ os.makedirs(os.path.join(CACHE_DIR, "plots"), exist_ok=True)
 
 # 数据集配置：03A, 03B, 04A
 DATASETS = [
-    {"name": "03A", "file_h1": "O3a_H1_1238919012.pt", "file_l1": "O3a_L1_1238919012.pt", "seed": 999},
-    {"name": "03B", "file_h1": "O3b_H1_1264612209.pt", "file_l1": "O3b_L1_1264612209.pt", "seed": 2024},
-    {"name": "04A", "file_h1": "O4a_H1_1369205931.pt", "file_l1": "O4a_L1_1369205931.pt", "seed": 12345}
+    {"name": "03A", "file_h1": "O3a_H1_1238919012.pt", "file_l1": "O3a_L1_1238919012.pt", "snr_min": 7.0, "snr_max": 8.0},
+    {"name": "03B", "file_h1": "O3b_H1_1264612209.pt", "file_l1": "O3b_L1_1264612209.pt", "snr_min": 6.0, "snr_max": 7.0},
+    {"name": "04A", "file_h1": "O4a_H1_1369205931.pt", "file_l1": "O4a_L1_1369205931.pt", "snr_min": 5.0, "snr_max": 6.0}
 ]
+
+# 固定种子配置
+FIXED_SEEDS = {
+    "03A": 1400,
+    "03B": 1400,
+    "04A": 1300
+}
 
 N_TRAIN = 20000            
 N_CALIB = 1000            
@@ -299,19 +306,22 @@ if __name__ == "__main__":
     # 初始化 CSV
     with open(CSV_LOG_PATH, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["Dataset", "GPS", "Seed", "Xi", "AI_Mean_Limit", "AI_Std_Dev", "Trad_Mean_Limit", "Trad_Std_Dev", "Scaling_Factor"])
+        writer.writerow(["Dataset", "GPS", "Seed", "Xi", "AI_Mean_Limit", "AI_Std_Dev", "Trad_Mean_Limit", "Trad_Std_Dev", "Scaling_Factor", "SNR"])
     
     # 初始化详细CSV
     with open(CSV_DETAILED_PATH, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(["Dataset", "GPS", "Seed", "Xi", "Round", "AI_Value", "Trad_Value"])
+    
+
 
     # ==================== 大循环：遍历数据集 ====================
     for i, dataset in enumerate(DATASETS):
         dataset_name = dataset["name"]
         data_file_h1 = dataset["file_h1"]
         data_file_l1 = dataset["file_l1"]
-        seed = dataset["seed"]
+        snr_min = dataset["snr_min"]
+        snr_max = dataset["snr_max"]
         
         # 从文件名中提取GPS
         gps = data_file_h1.split('_')[-1].split('.')[0]
@@ -320,15 +330,16 @@ if __name__ == "__main__":
         data_file_h1_full = data_file_h1
         data_file_l1_full = data_file_l1
         
-        print(f"\n{'='*100}")
+        print(f"\n{'='*120}")
         print(f"开始处理 {dataset_name} (进度: {i+1}/{len(DATASETS)})")
-        print(f"{'='*100}")
+        print(f"{'='*120}")
         print(f"  数据集: {dataset_name}")
         print(f"  GPS时间戳: {gps}")
-        print(f"  使用种子: {seed}")
+        print(f"  SNR目标范围: {snr_min} ~ {snr_max}")
         print(f"  H1数据文件: {data_file_h1_full}")
         print(f"  L1数据文件: {data_file_l1_full}")
-        print(f"{'='*100}")
+        print(f"  固定种子: {FIXED_SEEDS.get(dataset_name, 1000)}")
+        print(f"{'='*120}")
         
         # 1. 物理标定
         print("\n[Step 1] 执行物理标定...")
@@ -342,12 +353,18 @@ if __name__ == "__main__":
         print(f"  正在加载: L1={data_file_l1_full}")
         h1_gpu, l1_gpu = load_data_to_gpu(data_file_h1_full, data_file_l1_full)
         print(f"[Step 2] 数据加载完成: H1 shape = {h1_gpu.shape}, L1 shape = {l1_gpu.shape}")
-        print(f"  使用的种子: {seed}")
         
         sim_gpu = Phase9SimulatorGPU(h1_gpu, l1_gpu, scaling_factor=PHYSICAL_SCALING)
         prior = BoxUniform(low=torch.tensor([-13.0, 0.001], device=device), 
                            high=torch.tensor([5.0, 1.0], device=device))
         print("[Step 2] 模拟器初始化完成\n")
+
+        # 使用固定种子
+        seed = FIXED_SEEDS.get(dataset_name, 1000)
+        
+        print(f"\n{'='*80}")
+        print(f"使用固定种子 {seed} 处理 {dataset_name}")
+        print(f"{'='*80}")
 
         # A. 训练
         print("[Step 3] 开始训练模型...")
@@ -370,10 +387,7 @@ if __name__ == "__main__":
         inf_tr.append_simulations(theta_tr, x_tr[:, [0, 3]])
         post_tr = inf_tr.build_posterior(inf_tr.train(show_train_summary=False))
         
-        # B. 检测 (随机熵)
-        random_entropy = int.from_bytes(os.urandom(4), byteorder='big')
-        torch.manual_seed(random_entropy)
-        
+        # B. 检测
         print("执行快速批量 CFAR 校准...")
         thresh_ai = fast_calibrate(post_ai, sim_gpu, N_CALIB, None)
         thresh_tr = fast_calibrate(post_tr, sim_gpu, N_CALIB, [0, 3])
@@ -381,17 +395,60 @@ if __name__ == "__main__":
         print(f"校准阈值: AI={thresh_ai:.2f}, Trad={thresh_tr:.2f}")
         
         current_avg_rounds = N_AVG_ROUNDS
-        print(f"开始高灵敏度扫描 (Xi loop, {current_avg_rounds} rounds)...")
+        print(f"开始高灵敏度扫描...")
         
         xi_vals = [0.001, 0.01, 0.1, 0.5, 1.0]
         res_ai, res_tr = [], []
         res_ai_std, res_tr_std = [], []
+        snr_calc = 0.0
         
+        # 首先只计算Xi=0.001的检测限和SNR进行判断
+        print(f"\n处理 Xi=0.001 (100次评价)...")
+        temp_ai = []
+        temp_tr = []
+        snr_calc = 0.0
+        
+        # 执行100次评价并打印每次值
+        for round_idx in range(current_avg_rounds):
+            ai_val = find_limit(post_ai, sim_gpu, xi_vals[0], thresh_ai, None)
+            tr_val = find_limit(post_tr, sim_gpu, xi_vals[0], thresh_tr, [0, 3])
+            temp_ai.append(ai_val)
+            temp_tr.append(tr_val)
+            
+            # 只在指定轮次打印结果
+            if (round_idx + 1) % 10 == 0 or round_idx == 0:
+                print(f"  Round {round_idx+1:3d}: AI={ai_val:.4f}, Trad={tr_val:.4f}")
+        
+        # 计算平均值并打印
+        avg_ai_100 = np.mean(temp_ai)
+        avg_tr_100 = np.mean(temp_tr)
+        print(f"  前100轮平均值: AI={avg_ai_100:.4f}, Trad={avg_tr_100:.4f}")
+        
+        mean_ai, std_ai = np.mean(temp_ai), np.std(temp_ai)
+        mean_tr, std_tr = np.mean(temp_tr), np.std(temp_tr)
+        
+        # 计算最终SNR
+        snr_calc = np.sqrt((10**mean_ai)/xi_vals[0]) * PHYSICAL_SCALING
+        
+        # 保存Xi=0.001的结果
+        res_ai.append(mean_ai)
+        res_tr.append(mean_tr)
+        res_ai_std.append(std_ai)
+        res_tr_std.append(std_tr)
+        
+        # 计算其他Xi值的检测限
         with open(CSV_LOG_PATH, 'a', newline='') as f_log, open(CSV_DETAILED_PATH, 'a', newline='') as f_detail:
             writer_log = csv.writer(f_log)
             writer_detail = csv.writer(f_detail)
             
-            for xi in xi_vals:
+            # 先写入Xi=0.001的结果
+            writer_log.writerow([dataset_name, gps, seed, xi_vals[0], f"{mean_ai:.4f}", f"{std_ai:.4f}", f"{mean_tr:.4f}", f"{std_tr:.4f}", f"{PHYSICAL_SCALING:.2f}", f"{snr_calc:.2f}"])
+            for round_idx in range(current_avg_rounds):
+                writer_detail.writerow([dataset_name, gps, seed, xi_vals[0], round_idx+1, f"{temp_ai[round_idx]:.6f}", f"{temp_tr[round_idx]:.6f}"])
+            print(f" -> Xi={xi_vals[0]}: AI={mean_ai:.4f} ± {std_ai:.4f} | Trad={mean_tr:.4f} ± {std_tr:.4f} | SNR={snr_calc:.2f}")
+            
+            # 计算其他Xi值
+            for xi in xi_vals[1:]:
                 print(f"\n处理 Xi={xi} (100次评价)...")
                 temp_ai = []
                 temp_tr = []
@@ -418,7 +475,7 @@ if __name__ == "__main__":
                 res_ai_std.append(std_ai)
                 res_tr_std.append(std_tr)
                 
-                writer_log.writerow([dataset_name, gps, seed, xi, f"{mean_ai:.4f}", f"{std_ai:.4f}", f"{mean_tr:.4f}", f"{std_tr:.4f}", f"{PHYSICAL_SCALING:.2f}"])
+                writer_log.writerow([dataset_name, gps, seed, xi, f"{mean_ai:.4f}", f"{std_ai:.4f}", f"{mean_tr:.4f}", f"{std_tr:.4f}", f"{PHYSICAL_SCALING:.2f}", "N/A"])
                 print(f" -> Xi={xi}: AI={mean_ai:.4f} ± {std_ai:.4f} | Trad={mean_tr:.4f} ± {std_tr:.4f}")
 
         # C. 绘图 - 灵敏度
@@ -439,7 +496,6 @@ if __name__ == "__main__":
         # D. 绘图 - SNR Check
         xi_check = xi_vals[0]
         ai_lim = res_ai[0]
-        snr_calc = np.sqrt((10**ai_lim)/xi_check) * PHYSICAL_SCALING
         
         plt.figure(figsize=(12, 6))
         log_omega_scan = np.linspace(-9.0, -5.0, 30)
@@ -469,7 +525,8 @@ if __name__ == "__main__":
             'data_file_h1': data_file_h1,
             'data_file_l1': data_file_l1,
             'dataset': dataset_name,
-            'gps': gps
+            'gps': gps,
+            'snr': snr_calc
         }, model_path_ai)
         
         # 保存传统模型
@@ -485,6 +542,9 @@ if __name__ == "__main__":
         
         print(f"模型保存完成: {model_path_ai}")
         print(f"模型保存完成: {model_path_tr}")
+
+        # 处理完成
+        print(f"\n✅ {dataset_name} 使用种子 {seed} 处理完成")
 
         del post_ai, post_tr, inf_ai, inf_tr
         torch.cuda.empty_cache()
